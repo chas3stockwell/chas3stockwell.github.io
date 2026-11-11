@@ -1,0 +1,3 @@
+/* nbconvert looks for custom.css beside the exported notebook.
+   The 2019 repository did not include one. This file keeps that link
+   from 404ing. Add overrides here if you restyle the preserved page. */
