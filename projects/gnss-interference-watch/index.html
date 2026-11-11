@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GNSS Interference Watch · Chase Stockwell</title>
+  <meta name="description" content="GNSS Interference Watch is a Northwestern CS 310 serverless AWS class project that tracks GNSS interference from public UCAR radio-occultation data and GPSJam.">
+  <link rel="canonical" href="https://chas3stockwell.github.io/projects/gnss-interference-watch/">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/styles.css">
+  <meta name="theme-color" content="#f4f1ea">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="wordmark" href="/">
+        <span class="mark" aria-hidden="true"></span>
+        Chase Stockwell
+      </a>
+      <nav class="site-nav" aria-label="Primary">
+        <a href="/#work">Work</a>
+        <a href="/#about">About</a>
+        <a href="/#contact">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" class="page page-wide">
+    <p class="back"><a href="/#work">All work</a></p>
+    <article>
+      <p class="eyebrow">Northwestern CS 310 · Scalable Software Architectures</p>
+      <h1>GNSS Interference Watch</h1>
+      <p class="lede">A serverless AWS class project that tracks GNSS interference from public UCAR radio-occultation data and GPSJam aircraft reports.</p>
+      <p>Every day, the service downloads public satellite measurements, notices places where those measurements suddenly go missing (a sign of GPS jamming), double-checks those places against airplane GPS-trouble maps, and can email an alert and show the result on a map.</p>
+      <p class="repo"><a href="https://github.com/chas3stockwell/gnss-interference-watch">github.com/chas3stockwell/gnss-interference-watch</a></p>
+      <p class="note">Class project proposal by Chase Stockwell, November 2026, written for a three-person group. This page summarizes that design. It uses public data only.</p>
+
+      <h2>The problem</h2>
+      <p>GPS is the system that tells a phone, a plane, or a ship where it is, by listening to weak radio signals from satellites. GNSS is the general name for satellite navigation, including GPS and Europe's Galileo.</p>
+      <p>Because the signals are weak, they are easy to interfere with:</p>
+      <ul>
+        <li><strong>Jamming</strong> blasts radio noise so a receiver cannot hear the satellites.</li>
+        <li><strong>Spoofing</strong> sends fake signals so a receiver thinks it is somewhere else.</li>
+      </ul>
+      <p>Both show up near conflict zones. Pilots lose GPS, ships report the wrong position, and weather data can suffer. Finding the hotspots is still mostly manual. This project is a design for automating that.</p>
+      <p>The clue is missing satellite measurements. Some satellites measure the atmosphere by watching a GNSS signal graze the air as a navigation satellite sets behind the Earth. That technique is radio occultation. Each measurement is a profile: a column of temperature and moisture at one place and time. UCAR publishes new profiles every day. Those satellites need a clean GNSS signal too. Where the signal is jammed, fewer profiles arrive.</p>
+      <p>A second public source, <a href="https://gpsjam.org/">GPSJam.org</a>, maps GPS trouble reported by airplanes. Planes broadcast position and GPS quality through ADS-B. GPSJam marks a map cell "high" when more than 10% of planes there had degraded GPS. It cannot tell jamming from spoofing, and it only sees where planes fly. Two independent sources agreeing is stronger evidence than one.</p>
+
+      <h2>How a day runs</h2>
+      <ol class="steps">
+        <li><span><strong>Wake up.</strong> Once a day, a timer starts the job.</span></li>
+        <li><span><strong>Collect.</strong> Download that day's new files from UCAR and record where and when each profile was measured.</span></li>
+        <li><span><strong>Count.</strong> Count profiles in each region the project watches, per provider, per day.</span></li>
+        <li><span><strong>Detect.</strong> Compare each count with what is normal for that region. A large, sudden drop is a possible jamming hotspot.</span></li>
+        <li><span><strong>Check and tell.</strong> Compare flagged regions with GPSJam, assign a risk score, email subscribers when the risk is high, and show the results on a web map.</span></li>
+      </ol>
+
+      <h2>Architecture</h2>
+      <ul class="legend">
+        <li><span class="swatch swatch-collect" aria-hidden="true"></span> Part 1 · Collect</li>
+        <li><span class="swatch swatch-detect" aria-hidden="true"></span> Part 2 · Detect</li>
+        <li><span class="swatch swatch-alert" aria-hidden="true"></span> Part 3 · Alert and show</li>
+      </ul>
+      <figure class="diagram">
+        <figcaption id="diagram-caption">Each box is one AWS service. The colored header is the service name, and the text inside says what it does. Steps 1–7 run every day on their own. A and B run when someone uses the website. Dashed boxes are optional or stretch work. On a small screen, scroll sideways inside the frame.</figcaption>
+        <div class="diagram-scroll" tabindex="0" aria-label="Wide architecture diagram. Scroll horizontally to see all of it.">
+          <img src="architecture.svg" width="1500" height="830" alt="Diagram of the AWS pipeline for GNSS Interference Watch. It shows the daily collect, detect, and alert steps, and the separate path used when someone opens the map." aria-describedby="diagram-caption">
+        </div>
+      </figure>
+      <p><a href="architecture.svg">Open the diagram full size</a></p>
+
+      <h2>Three parts, one per teammate</h2>
+      <p>The course asks for at least three real server operations, not only saving or fetching a file. Each teammate owns one. They meet at agreed data formats, so each part can be built and tested on its own.</p>
+
+      <section class="part part-collect">
+        <h3>Part 1 · Collect</h3>
+        <p>Every morning, find the day's new UCAR files, download them, open them, and record each profile's latitude, longitude, time, and quality. EventBridge starts a Planner Lambda. The planner puts one SQS ticket per file, so many Reader Lambdas can work at once. A dead-letter queue holds tickets that still fail after three tries, instead of stopping the whole job. Readers run as a container image because the scientific libraries (netCDF and BUFR) are large. Cleaned rows land in S3 as Parquet files. One count per region, provider, and day lands in DynamoDB.</p>
+      </section>
+
+      <section class="part part-detect">
+        <h3>Part 2 · Detect</h3>
+        <p>Compare each region's daily count with its normal rate. Two numbers matter. The density ratio is profiles received divided by profiles expected, using that provider's usual rate at that latitude. A ratio of 1 is normal. The rolling z-score says how far today is from the region's recent average, in ordinary day-to-day variation. A region is flagged when the ratio is low and the drop is unusual for that place. Small regions get smoothed over several days. This part also owns the database and the API the map calls: regions, a time series, and a way to start a backfill for an older date range.</p>
+      </section>
+
+      <section class="part part-alert">
+        <h3>Part 3 · Alert and show</h3>
+        <p>Check flagged regions against GPSJam. Measure how much of the region is marked "high," and whether profile gaps and airplane reports rise and fall together. Combine the profile drop, the GPSJam overlap, and how many days the problem has lasted into one risk score: low, medium, or high. If a region crosses the alert level, SNS emails subscribers. An optional Bedrock step can write a two-sentence summary. The demo map is a simple Leaflet page hosted on S3. It colors each region, has a date slider, and shows the risk details on click.</p>
+      </section>
+
+      <h2>What it is built from</h2>
+      <div class="table-wrap">
+        <table>
+          <caption>AWS pieces in the CS 310 design. Bedrock and SageMaker are optional. The rest is the minimum version.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Service</th>
+              <th scope="col">What it does here</th>
+              <th scope="col">Part</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">EventBridge</th>
+              <td>Alarm clock that starts the daily job.</td>
+              <td>1 · Collect</td>
+            </tr>
+            <tr>
+              <th scope="row">Lambda</th>
+              <td>Short programs that run only when called: Planner, Reader, Detector, Cross-checker, and the API request handler.</td>
+              <td>All</td>
+            </tr>
+            <tr>
+              <th scope="row">SQS</th>
+              <td>One to-do ticket per data file, plus a problem pile for files that keep failing.</td>
+              <td>1 · Collect</td>
+            </tr>
+            <tr>
+              <th scope="row">S3</th>
+              <td>Cleaned profile files, and hosting for the demo map.</td>
+              <td>1 and 3</td>
+            </tr>
+            <tr>
+              <th scope="row">DynamoDB</th>
+              <td>Daily counts, flagged regions, jobs, and subscribers.</td>
+              <td>2 · Detect</td>
+            </tr>
+            <tr>
+              <th scope="row">Step Functions</th>
+              <td>Runs the detector, then the cross-checker, in that order.</td>
+              <td>2 and 3</td>
+            </tr>
+            <tr>
+              <th scope="row">API Gateway</th>
+              <td>Front door for the public API the map and other tools call.</td>
+              <td>2 and 3</td>
+            </tr>
+            <tr>
+              <th scope="row">SNS</th>
+              <td>Emails subscribers when a region's risk is high.</td>
+              <td>3 · Alert</td>
+            </tr>
+            <tr>
+              <th scope="row">CloudWatch</th>
+              <td>Logs, and an alarm if the problem pile grows.</td>
+              <td>All</td>
+            </tr>
+            <tr>
+              <th scope="row">Bedrock (optional)</th>
+              <td>Writes a short plain-English alert summary.</td>
+              <td>3 · Alert</td>
+            </tr>
+            <tr>
+              <th scope="row">SageMaker (stretch)</th>
+              <td>A detector trained on a longer history, if the simple rules are not enough.</td>
+              <td>2 · Detect</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>Who it is for</h2>
+      <p>The one-line problem statement from the proposal: operations teams learn about GPS interference late and by word of mouth. They need an automated, evidence-backed daily alert of where interference is happening.</p>
+      <ul>
+        <li>Airline and airport operations teams, who can warn pilots.</li>
+        <li>Ship operators and maritime authorities.</li>
+        <li>Defense and intelligence analysts.</li>
+        <li>Weather centers that depend on radio-occultation data and need to know why measurements are missing.</li>
+      </ul>
+      <p>The north-star metric is time from the start of interference to the alert. Supporting checks are the share of alerts that GPSJam confirms, and false alarms in quiet control regions.</p>
+      <p>The smallest useful version is the three parts above, a few hotspot regions, a few control regions, email alerts, and the map. Custom regions drawn on the map, the Bedrock summary, and the SageMaker detector are stretch work. Ship the daily alert first.</p>
+
+      <h2>Scope notes</h2>
+      <ul>
+        <li>A provider outage also lowers counts. The design compares control regions from the same provider on the same day, and it requires GPSJam agreement before it calls a risk "high."</li>
+        <li>GPSJam is an independent public site. The plan is to download it once a day, cache it, and confirm the file format before depending on it.</li>
+        <li>Daily files are large enough to matter, and a Lambda run has a time limit. One file per queue ticket keeps each run small.</li>
+      </ul>
+      <p>Source and later build notes: <a href="https://github.com/chas3stockwell/gnss-interference-watch">chas3stockwell/gnss-interference-watch</a>.</p>
+    </article>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell">
+      <p>Chase Stockwell · Evanston, Illinois · Kellogg MBA, graduating June 2027</p>
+    </div>
+  </footer>
+</body>
+</html>
